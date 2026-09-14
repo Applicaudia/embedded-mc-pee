@@ -244,6 +244,27 @@ interface NormalizedCandidate {
   readonly ambiguous: boolean;
 }
 
+/**
+ * Extracts a human-readable message from an unknown error value (Error instance,
+ * ReplayMissError object, structured API error, or primitive).
+ */
+function formatErrorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  if (typeof err === 'object' && err !== null) {
+    if ('message' in err && typeof (err as { message: unknown }).message === 'string') {
+      return (err as { message: string }).message;
+    }
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return String(err);
+    }
+  }
+  return String(err);
+}
+
 // ============================================================================
 // Config Validation
 // ============================================================================
@@ -555,7 +576,7 @@ Please fix the error and return ONLY a valid JSON object following the output co
           addTrace({ kind: 'repair', attempt: iteration, outcome: 'succeeded' });
           return { ok: true, turn: repairValidation.value };
         } catch (err) {
-          addTrace({ kind: 'repair', attempt: iteration, outcome: 'failed', detail: err instanceof Error ? err.message : 'Unknown error' });
+          addTrace({ kind: 'repair', attempt: iteration, outcome: 'failed', detail: formatErrorMessage(err) });
           return { ok: false };
         }
       };
@@ -585,6 +606,8 @@ Please fix the error and return ONLY a valid JSON object following the output co
 
         // Retry this model until success, repair exhausted, or degeneration abort
         let modelDegenerations = state.degenerationCounts.get(model) ?? 0;
+        state.remainingIterations = resolved.maxIterations;
+        state.toolCallsThisIteration.clear();
 
         while (state.remainingIterations > 0) {
           // Check iteration budget
@@ -652,6 +675,26 @@ Please fix the error and return ONLY a valid JSON object following the output co
           } catch (err) {
             dbg.warn('Model call error:', err);
             const isTransient = isTransientProviderError(err);
+            const errorMessage = formatErrorMessage(err);
+            const status = (err as { status?: number | string })?.status ?? (err as { code?: number | string })?.code;
+
+            emit({
+              type: 'model_error',
+              correlationId,
+              model,
+              attempt: iteration,
+              error: errorMessage,
+              status,
+              isTransient
+            });
+            addTrace({
+              kind: 'model_error',
+              model,
+              attempt: iteration,
+              error: errorMessage,
+              status,
+              isTransient
+            });
 
             if (isTransient) {
               const currentRetries = state.transientRetryCounts.get(model) ?? 0;
@@ -857,7 +900,7 @@ Please fix the error and return ONLY a valid JSON object following the output co
               continue;
             } catch (err) {
               // Handler threw -> in-band error result
-              const errorText = err instanceof Error ? err.message : 'Unknown error';
+              const errorText = formatErrorMessage(err);
               state.toolResults.push({
                 name: toolName,
                 args: toolArgs,
@@ -873,6 +916,7 @@ Please fix the error and return ONLY a valid JSON object following the output co
           // No tool call -> validate envelope
           const payload = candidate.extractedJson;
           if (!payload) {
+            addTrace({ kind: 'decision', decision: 'extraction_failed', detail: `Failed to extract JSON from raw response (length: ${resp.rawText.length})` });
             // No valid candidate -> repair
             if (state.remainingRepairs > 0) {
               state.remainingRepairs--;
@@ -901,6 +945,7 @@ Please fix the error and return ONLY a valid JSON object following the output co
           // Validate envelope
           const validation = validateEnvelopeOutput(payload, contract.validateHostPayload, contract.manifest);
           if (!validation.ok) {
+            addTrace({ kind: 'decision', decision: 'validation_failed', detail: `${validation.failure.code}: ${validation.failure.message}` });
             // Validation failed -> repair
             if (state.remainingRepairs > 0) {
               state.remainingRepairs--;

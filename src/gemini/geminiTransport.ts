@@ -287,13 +287,12 @@ export function createGeminiTransport(
     }
   }
 
-  // Resolve timeout (use provided or default)
-  const timeoutMs = options.timeoutMs ?? DEFAULT_GEMINI_TIMEOUT_MS;
-
   // Build the transport implementation
   const transport: LlmTransport = {
     complete: async (req: LlmRequest, opts: { timeoutMs: number }): Promise<LlmResponse> => {
-      const effectiveTimeoutMs = Math.min(timeoutMs, opts.timeoutMs);
+      const effectiveTimeoutMs = options.timeoutMs !== undefined
+        ? Math.min(options.timeoutMs, opts.timeoutMs)
+        : opts.timeoutMs;
 
       // Map tool declarations to function declarations
       const functionDeclarations: FunctionDeclaration[] = req.toolDeclarations.map(

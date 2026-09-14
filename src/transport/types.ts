@@ -129,6 +129,7 @@ export interface FailureContext {
  */
 export type TraceEntry =
   | { readonly kind: 'model_call'; readonly model: string; readonly attempt: number; readonly latencyMs: number; readonly rawCharCount: number; readonly snippet: string }
+  | { readonly kind: 'model_error'; readonly model: string; readonly attempt: number; readonly error: string; readonly status?: number | string; readonly isTransient: boolean }
   | { readonly kind: 'tool_call'; readonly name: string; readonly ok: boolean; readonly attempt: number }
   | {
       readonly kind: 'repair';
@@ -147,6 +148,8 @@ export type TraceEntry =
         | 'repair_skipped_degenerate'
         | 'degeneration_config_error'
         | 'transient_backoff'
+        | 'extraction_failed'
+        | 'validation_failed'
         | 'budget_exhausted';
       readonly detail?: string;
     };
@@ -176,6 +179,7 @@ export interface TurnTrace {
  */
 export type HarnessTelemetryEvent =
   | { readonly type: 'model_call'; readonly correlationId: string; readonly model: string; readonly attempt: number; readonly latencyMs: number; readonly rawCharCount: number; readonly snippet: string }
+  | { readonly type: 'model_error'; readonly correlationId: string; readonly model: string; readonly attempt: number; readonly error: string; readonly status?: number | string; readonly isTransient: boolean }
   | { readonly type: 'validated'; readonly correlationId: string; readonly state: EnvelopeState; readonly attempt: number }
   | { readonly type: 'repair_attempted' | 'repair_succeeded'; readonly correlationId: string; readonly attempt: number }
   | { readonly type: 'degenerate_output'; readonly correlationId: string; readonly model: string; readonly signatures: readonly string[] }
