@@ -49,9 +49,13 @@ Non-test files setting temperature values, per app:
 
 | App | Files | Location |
 |---|---|---|
-| closedloop | 14 | 11 in `functions/src/callables/` (grill, extraction, review surfaces) + `extractReviewResult.ts`, `extractTemplateQuestions.ts`, `pdfVisionFallback.ts` |
+| closedloop | 15 | 11 in `functions/src/callables/` (grill, extraction, review surfaces) + `extractReviewResult.ts`, `extractTemplateQuestions.ts`, `pdfVisionFallback.ts` + the seam `functions/src/shared/ai/emcpHarness.ts` (forwards `opts.temperature` into harness options) |
 | strobopro | 1 | `functions/src/shared/geminiClient.ts` |
 | courtpuzzle | 3 | `allocationExtractionProvider.ts`, `copilotProvider.ts`, `demandExtractionProvider.ts` |
+
+The seam row matters most: `emcpHarness.ts` is the one file every callable
+goes through, so its temperature forwarding must go in the same Phase 2
+pass that strips the per-callable values.
 
 All are removed in each app's migration phase (closedloop Phase 2, strobopro
 Phase 3, courtpuzzle Phase 6 of the convergence epic).

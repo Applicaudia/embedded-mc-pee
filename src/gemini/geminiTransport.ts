@@ -317,12 +317,12 @@ export function createGeminiTransport(
         // "medium" | "high" — ai.google.dev generate-content ThinkingConfig;
         // the SDK passes thinkingConfig through verbatim, and the lowercase
         // form is production-verified). The SDK's exported `ThinkingLevel`
-        // enum uses UPPERCASE member names, so the value is widened to the
-        // declared field type instead of being cast to the enum: the runtime
-        // string is the contract, not the enum.
+        // enum uses UPPERCASE member names, so only the enum-typed field is
+        // widened — the object literal itself stays checked against
+        // ThinkingConfig: the runtime string is the contract, not the enum.
         config.thinkingConfig = {
-          thinkingLevel: req.thinkingLevel
-        } as unknown as ThinkingConfig;
+          thinkingLevel: req.thinkingLevel as unknown as ThinkingConfig['thinkingLevel']
+        };
       }
 
       // Build contents. Vision inputs (inlineData) come first, followed by

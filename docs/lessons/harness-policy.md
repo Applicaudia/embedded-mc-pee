@@ -46,10 +46,11 @@ Two related hardening points from the same review:
 
 Degeneration handling follows the signatures described in
 [schema-and-degeneration.md](schema-and-degeneration.md): conclusive
-`ngram_repetition` routes to repair/fallback immediately; `max_tokens` alone
-is only a hint, so MAX_TOKENS routes to repair/fallback **after extraction
-and validation fail** — a MAX_TOKENS response carrying a complete valid
-envelope succeeds normally.
+`ngram_repetition` takes the degeneration path immediately (skips repair;
+counts toward the model's degeneration abort, then next iteration, fallback
+after the threshold); `max_tokens` alone is only a hint, so MAX_TOKENS
+reaches the repair path **only after extraction and validation fail** — a
+MAX_TOKENS response carrying a complete valid envelope succeeds normally.
 
 ## Transient error classification is deliberately message-parsing
 

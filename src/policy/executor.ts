@@ -300,13 +300,16 @@ function formatErrorMessage(err: unknown): string {
  * Safe fallback turn used when no host handler is configured and as the last
  * resort when even the host's `onFallbackExhausted` throws.
  */
-const DEFAULT_FALLBACK_QUESTION_TURN: AgentTurn<never> = {
-  envelope: {
+// Shared module singleton returned on every fallback path, so it is frozen
+// (envelope included): a host mutating its returned turn must never leak
+// into the next caller's fallback.
+const DEFAULT_FALLBACK_QUESTION_TURN: AgentTurn<never> = Object.freeze({
+  envelope: Object.freeze({
     state: 'question',
     questionText: "I couldn't safely process that request. Could you please clarify or rephrase what you'd like to do?",
     explanation: 'I was unable to validate a response from the model.'
-  }
-};
+  })
+});
 
 /**
  * Default `onFallbackExhausted` handler: accepts the failure context (unused)

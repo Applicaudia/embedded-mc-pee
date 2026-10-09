@@ -1021,6 +1021,20 @@ describe('Agent Harness Executor', () => {
         expect(turnResult.turn.envelope.state).toBe('question');
         const threwEntry = turnResult.trace.entries.find(e => e.kind === 'decision' && e.decision === 'harness_threw');
         expect(threwEntry).toBeDefined();
+        // Partial-trace preservation: entries recorded before the throw must
+        // survive into the harness_threw trace. The transient 429 path records
+        // a model_error entry and a transient_backoff decision before the
+        // awaited (rejecting) sleep, so both must be present here.
+        const preThrowModelError = turnResult.trace.entries.find(e => e.kind === 'model_error');
+        expect(preThrowModelError).toBeDefined();
+        const preThrowBackoff = turnResult.trace.entries.find(e => e.kind === 'decision' && e.decision === 'transient_backoff');
+        expect(preThrowBackoff).toBeDefined();
+        // Pre-throw entries precede the harness_threw entry
+        const threwIndex = turnResult.trace.entries.findIndex(e => e.kind === 'decision' && e.decision === 'harness_threw');
+        const backoffIndex = turnResult.trace.entries.findIndex(e => e.kind === 'decision' && e.decision === 'transient_backoff');
+        expect(threwIndex).toBeGreaterThanOrEqual(0);
+        expect(backoffIndex).toBeGreaterThanOrEqual(0);
+        expect(backoffIndex).toBeLessThan(threwIndex);
       }
     });
 

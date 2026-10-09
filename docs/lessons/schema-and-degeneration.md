@@ -39,12 +39,15 @@ Degenerate output has two distinct signatures in `src/diagnostics/degeneration.t
 - `ngram_repetition` — **conclusive**. A phrase of 1-8 words repeats
   consecutively until the total reaches the threshold (default 120 words).
   The period is detected, not assumed: observed loops repeat short phrases
-  ("Done. Complete. OK.") and single words alike.
+  ("Done. Complete. OK.") and single words alike. A conclusive signature
+  takes the degeneration path immediately (skips repair; counts toward the
+  model's degeneration abort, decision `repair_skipped_degenerate`), and
+  the model falls back after the abort threshold.
 - `max_tokens` — **suggestive only** since 0.3.0. A `finishReason:
   'MAX_TOKENS'` response can still carry a complete, valid envelope, so
-  MAX_TOKENS routes to repair/fallback **only after extraction and
-  validation fail**. Treating MAX_TOKENS as automatically degenerate skips
-  repair on responses that were fine.
+  MAX_TOKENS reaches the degeneration/repair path **only after extraction
+  and validation fail**. Treating MAX_TOKENS as automatically degenerate
+  skips repair on responses that were fine.
 
 Two related traps:
 
