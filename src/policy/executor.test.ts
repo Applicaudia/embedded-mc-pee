@@ -9,9 +9,12 @@
  * - Repeated identical tool call detection
  * - Tool caps (per-iteration and total)
  * - Budget exhaustion
- * - Degeneration detection and fallback
+ * - Degeneration detection and fallback (conclusive ngram repetition)
+ * - MAX_TOKENS guard (valid envelope still succeeds; failed extraction
+ *   routes to repair with raised cap + lowered thinkingLevel)
  * - Transient error backoff
- * - `runTurn` never rejects (rejecting transport, throwing telemetry listener)
+ * - `runTurn` never rejects (rejecting transport, throwing telemetry
+ *   listener, rejecting injected sleep, throwing onFallbackExhausted)
  * - All telemetry event types emitted at least once
  */
 
@@ -196,6 +199,68 @@ describe('Agent Harness Executor', () => {
           transport,
           models: ['model-1', 'model-2'],
           maxIterations: 2
+        },
+        contract
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    it("rejects thinkingLevel 'minimal' (Gemini 3.7/3.8 hard-400 it)", () => {
+      const result = createHarness(
+        {
+          transport,
+          models: ['model-1'],
+          // @ts-expect-error - deliberately invalid union member must be caught at runtime too
+          thinkingLevel: 'minimal'
+        },
+        contract
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.failures).toHaveLength(1);
+        expect(result.failures[0].code).toBe('thinking_level_invalid');
+      }
+    });
+
+    it('accepts medium and high thinkingLevel', () => {
+      for (const thinkingLevel of ['low', 'medium', 'high'] as const) {
+        const result = createHarness(
+          {
+            transport,
+            models: ['model-1'],
+            thinkingLevel
+          },
+          contract
+        );
+        expect(result.ok).toBe(true);
+      }
+    });
+
+    it('rejects invalid repairMaxOutputTokens (positive integer required)', () => {
+      for (const repairMaxOutputTokens of [0, -5, 1.5]) {
+        const result = createHarness(
+          {
+            transport,
+            models: ['model-1'],
+            repairMaxOutputTokens
+          },
+          contract
+        );
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.failures).toHaveLength(1);
+          expect(result.failures[0].code).toBe('repair_output_tokens_invalid');
+        }
+      }
+    });
+
+    it('accepts repairMaxOutputTokens below maxOutputTokens (no cross-field invariant)', () => {
+      const result = createHarness(
+        {
+          transport,
+          models: ['model-1'],
+          maxOutputTokens: 8_192,
+          repairMaxOutputTokens: 1_024
         },
         contract
       );
@@ -688,12 +753,17 @@ describe('Agent Harness Executor', () => {
   });
 
   describe('Degeneration detection and fallback', () => {
+    // Conclusive degeneration = ngram_repetition (>= 120 consecutive
+    // repeated words). MAX_TOKENS alone no longer takes this path (see the
+    // MAX_TOKENS guard tests below).
+    const DEGENERATE_TEXT = 'slot '.repeat(130);
+
     it('skips repair and falls back after 2 degenerations with a model', async () => {
       transport.setResponses([
         // First degenerate response
-        { rawText: 'x'.repeat(150), finishReason: 'MAX_TOKENS' },
+        { rawText: DEGENERATE_TEXT, finishReason: 'MAX_TOKENS' },
         // Second degenerate response
-        { rawText: 'y'.repeat(150), finishReason: 'MAX_TOKENS' },
+        { rawText: 'done complete ok '.repeat(45), finishReason: 'MAX_TOKENS' },
         // Third model succeeds
         { rawText: JSON.stringify(VALID_PROPOSAL) }
       ]);
@@ -729,8 +799,8 @@ describe('Agent Harness Executor', () => {
 
     it('returns all_fallbacks when all models degenerate', async () => {
       transport.setResponses([
-        { rawText: 'x'.repeat(150), finishReason: 'MAX_TOKENS' },
-        { rawText: 'y'.repeat(150), finishReason: 'MAX_TOKENS' }
+        { rawText: DEGENERATE_TEXT, finishReason: 'MAX_TOKENS' },
+        { rawText: 'done complete ok '.repeat(45), finishReason: 'MAX_TOKENS' }
       ]);
 
       const result = createHarness(
@@ -759,6 +829,304 @@ describe('Agent Harness Executor', () => {
       if (!turnResult.ok) {
         expect(turnResult.kind).toBe('all_fallbacks');
       }
+    });
+  });
+
+  describe('MAX_TOKENS guard', () => {
+    it('succeeds when a MAX_TOKENS response carries a complete valid envelope', async () => {
+      transport.setResponses([
+        { rawText: JSON.stringify(VALID_PROPOSAL), finishReason: 'MAX_TOKENS' }
+      ]);
+
+      const result = createHarness(
+        {
+          transport,
+          models: ['model-1'],
+          maxIterations: 1,
+          sleep: sleepSpy
+        },
+        contract
+      );
+
+      if (!result.ok) {
+        throw new Error('Failed to create harness');
+      }
+
+      const turnResult = await result.harness.runTurn({
+        systemInstruction: 'You are a test agent.',
+        promptText: 'Test prompt'
+      });
+
+      // Truncation flag alone is not degeneration: a complete valid envelope
+      // must still succeed.
+      expect(turnResult.ok).toBe(true);
+      if (turnResult.ok) {
+        expect(turnResult.turn.envelope.state).toBe('proposal');
+      }
+    });
+
+    it('routes MAX_TOKENS + failed extraction to repair with raised cap and lowered thinkingLevel', async () => {
+      transport.setResponses([
+        // Truncated garbage: MAX_TOKENS + no extractable JSON
+        { rawText: '{"state":"proposal","payload":{"summary":"trunc', finishReason: 'MAX_TOKENS' },
+        // Repair succeeds
+        { rawText: JSON.stringify(VALID_PROPOSAL) }
+      ]);
+
+      const result = createHarness(
+        {
+          transport,
+          models: ['model-1'],
+          maxIterations: 2,
+          maxRepairs: 1,
+          thinkingLevel: 'high',
+          maxOutputTokens: 8_192,
+          repairMaxOutputTokens: 65_536,
+          sleep: sleepSpy
+        },
+        contract
+      );
+
+      if (!result.ok) {
+        throw new Error('Failed to create harness');
+      }
+
+      const turnResult = await result.harness.runTurn({
+        systemInstruction: 'You are a test agent.',
+        promptText: 'Test prompt'
+      });
+
+      expect(turnResult.ok).toBe(true);
+      if (turnResult.ok) {
+        const repairEntry = turnResult.trace.entries.find(e => e.kind === 'repair' && e.outcome === 'succeeded');
+        expect(repairEntry).toBeDefined();
+      }
+
+      // First attempt keeps the configured cap and thinking level.
+      expect(transport.requests[0].maxOutputTokens).toBe(8_192);
+      expect(transport.requests[0].thinkingLevel).toBe('high');
+      // The MAX_TOKENS retry raises the cap to repairMaxOutputTokens and
+      // lowers the thinking level one step (fewer thinking tokens = more
+      // room for the payload).
+      expect(transport.requests[1].maxOutputTokens).toBe(65_536);
+      expect(transport.requests[1].thinkingLevel).toBe('medium');
+    });
+
+    it('defaults repair cap to maxOutputTokens when repairMaxOutputTokens is unset', async () => {
+      transport.setResponses([
+        { rawText: 'not json at all', finishReason: 'MAX_TOKENS' },
+        { rawText: JSON.stringify(VALID_PROPOSAL) }
+      ]);
+
+      const result = createHarness(
+        {
+          transport,
+          models: ['model-1'],
+          maxIterations: 2,
+          maxRepairs: 1,
+          maxOutputTokens: 4_096,
+          sleep: sleepSpy
+        },
+        contract
+      );
+
+      if (!result.ok) {
+        throw new Error('Failed to create harness');
+      }
+
+      const turnResult = await result.harness.runTurn({
+        systemInstruction: 'You are a test agent.',
+        promptText: 'Test prompt'
+      });
+
+      expect(turnResult.ok).toBe(true);
+      expect(transport.requests[1].maxOutputTokens).toBe(4_096);
+      // No thinkingLevel configured: the lowered retry tuning stays absent.
+      expect(transport.requests[1].thinkingLevel).toBeUndefined();
+    });
+
+    it('keeps repair tuning unchanged for non-MAX_TOKENS failures', async () => {
+      transport.setResponses([
+        // Plain extraction failure (finishReason STOP, no repetition)
+        { rawText: 'This is not valid JSON at all', finishReason: 'STOP' },
+        { rawText: JSON.stringify(VALID_PROPOSAL) }
+      ]);
+
+      const result = createHarness(
+        {
+          transport,
+          models: ['model-1'],
+          maxIterations: 2,
+          maxRepairs: 1,
+          thinkingLevel: 'high',
+          maxOutputTokens: 8_192,
+          repairMaxOutputTokens: 65_536,
+          sleep: sleepSpy
+        },
+        contract
+      );
+
+      if (!result.ok) {
+        throw new Error('Failed to create harness');
+      }
+
+      const turnResult = await result.harness.runTurn({
+        systemInstruction: 'You are a test agent.',
+        promptText: 'Test prompt'
+      });
+
+      expect(turnResult.ok).toBe(true);
+      // Repair cap still applies, but the thinking level is NOT lowered for
+      // a failure that was not a truncation.
+      expect(transport.requests[1].maxOutputTokens).toBe(65_536);
+      expect(transport.requests[1].thinkingLevel).toBe('high');
+    });
+  });
+
+  describe('runTurn never rejects: harness_threw guard', () => {
+    it('resolves failed (harness_threw) when injected sleep rejects during transient backoff', async () => {
+      const transientTransport: LlmTransport = {
+        complete: async (): Promise<LlmResponse> => {
+          const error: Error & { status?: number } = new Error('rate limited');
+          error.status = 429;
+          throw error;
+        }
+      };
+      const rejectingSleep = vi.fn((): Promise<void> => Promise.reject(new Error('sleep boom')));
+
+      const result = createHarness(
+        {
+          transport: transientTransport,
+          models: ['model-1'],
+          maxIterations: 1,
+          transientBackoffMs: 5,
+          sleep: rejectingSleep
+        },
+        contract
+      );
+
+      if (!result.ok) {
+        throw new Error('Failed to create harness');
+      }
+
+      const turnResult = await result.harness.runTurn({
+        systemInstruction: 'You are a test agent.',
+        promptText: 'Test prompt'
+      });
+
+      expect(rejectingSleep).toHaveBeenCalledWith(5);
+      expect(turnResult.ok).toBe(false);
+      if (!turnResult.ok) {
+        expect(turnResult.kind).toBe('harness_threw');
+        expect(turnResult.turn.envelope.state).toBe('question');
+        const threwEntry = turnResult.trace.entries.find(e => e.kind === 'decision' && e.decision === 'harness_threw');
+        expect(threwEntry).toBeDefined();
+        // Partial-trace preservation: entries recorded before the throw must
+        // survive into the harness_threw trace. The transient 429 path records
+        // a model_error entry and a transient_backoff decision before the
+        // awaited (rejecting) sleep, so both must be present here.
+        const preThrowModelError = turnResult.trace.entries.find(e => e.kind === 'model_error');
+        expect(preThrowModelError).toBeDefined();
+        const preThrowBackoff = turnResult.trace.entries.find(e => e.kind === 'decision' && e.decision === 'transient_backoff');
+        expect(preThrowBackoff).toBeDefined();
+        // Pre-throw entries precede the harness_threw entry
+        const threwIndex = turnResult.trace.entries.findIndex(e => e.kind === 'decision' && e.decision === 'harness_threw');
+        const backoffIndex = turnResult.trace.entries.findIndex(e => e.kind === 'decision' && e.decision === 'transient_backoff');
+        expect(threwIndex).toBeGreaterThanOrEqual(0);
+        expect(backoffIndex).toBeGreaterThanOrEqual(0);
+        expect(backoffIndex).toBeLessThan(threwIndex);
+      }
+    });
+
+    it('resolves failed (harness_threw) with the built-in question turn when onFallbackExhausted throws', async () => {
+      transport.setResponses([
+        // Non-transient extraction failure; repairs disabled so the chain exhausts
+        { rawText: 'Invalid JSON' }
+      ]);
+
+      const result = createHarness(
+        {
+          transport,
+          models: ['model-1'],
+          maxIterations: 1,
+          maxRepairs: 0,
+          onFallbackExhausted: () => {
+            throw new Error('fallback handler boom');
+          },
+          sleep: sleepSpy
+        },
+        contract
+      );
+
+      if (!result.ok) {
+        throw new Error('Failed to create harness');
+      }
+
+      const turnResult = await result.harness.runTurn({
+        systemInstruction: 'You are a test agent.',
+        promptText: 'Test prompt'
+      });
+
+      expect(turnResult.ok).toBe(false);
+      if (!turnResult.ok) {
+        expect(turnResult.kind).toBe('harness_threw');
+        // The default safe question turn, not the throwing handler's output
+        expect(turnResult.turn.envelope.state).toBe('question');
+        expect(turnResult.turn.envelope.questionText).toContain('clarify');
+      }
+    });
+  });
+
+  describe('Timeout race (sleep deadline fires)', () => {
+    it('times out a hanging model call, records the model_error, and falls back to the next model', async () => {
+      // model-1 hangs forever; only the injected-sleep deadline can end the race
+      const hangingThenOkTransport: LlmTransport = {
+        complete: (req: LlmRequest): Promise<LlmResponse> => {
+          if (req.model === 'model-1') {
+            return new Promise<LlmResponse>(() => {});
+          }
+          return Promise.resolve({ rawText: JSON.stringify(VALID_PROPOSAL) });
+        }
+      };
+      const immediateSleep = vi.fn((): Promise<void> => Promise.resolve());
+      const telemetryEvents: HarnessTelemetryEvent[] = [];
+      const timeoutMs = 5;
+
+      const result = createHarness(
+        {
+          transport: hangingThenOkTransport,
+          models: ['model-1', 'model-2'],
+          maxIterations: 1,
+          perModelTimeoutMs: timeoutMs,
+          sleep: immediateSleep,
+          onTelemetry: (e) => { telemetryEvents.push(e); }
+        },
+        contract
+      );
+
+      if (!result.ok) {
+        throw new Error('Failed to create harness');
+      }
+
+      const turnResult = await result.harness.runTurn({
+        systemInstruction: 'You are a test agent.',
+        promptText: 'Test prompt'
+      });
+
+      // The deadline fired for model-1
+      expect(immediateSleep).toHaveBeenCalledWith(timeoutMs);
+      // Non-transient timeout -> fell back to model-2, which succeeded
+      expect(turnResult.ok).toBe(true);
+      if (turnResult.ok) {
+        expect(turnResult.turn.envelope.state).toBe('proposal');
+      }
+      const timeoutError = turnResult.trace.entries.find(
+        e => e.kind === 'model_error' && e.error === 'Model call timed out'
+      );
+      expect(timeoutError).toBeDefined();
+      expect(
+        telemetryEvents.some(e => e.type === 'fallback_model' && e.fromModel === 'model-1' && e.toModel === 'model-2')
+      ).toBe(true);
     });
   });
 

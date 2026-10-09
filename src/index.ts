@@ -42,7 +42,7 @@
  *
  * Semver-major bumps indicate breaking API changes. Semver-minor/patch bumps are for new features and bug fixes.
  */
-export const LIBRARY_VERSION = '0.2.1' as const;
+export const LIBRARY_VERSION = '0.3.0' as const;
 
 /**
  * JSON safety & extraction.
@@ -310,8 +310,10 @@ export type { ContractLintFinding, LintThresholds } from './contract/lint';
 export type {
   AgentHarness,
   FailureContext,
+  HarnessFailureKind,
   HarnessResult,
   HarnessTelemetryEvent,
+  HarnessThinkingLevel,
   HarnessTurnInput,
   IterationContext,
   LlmRequest,
@@ -333,8 +335,17 @@ export type {
  * detection, transient backoff, and one repair retry with an error preamble.
  * `runTurn` NEVER rejects — every terminal condition is a typed
  * {@link HarnessResult} (`ok` turn, or `exhausted` / `budget` /
- * `all_fallbacks` / `config` with a safe fallback envelope from the host;
- * `config` is a hard harness-configuration failure — no retry, no fallback).
+ * `all_fallbacks` / `config` / `harness_threw` with a safe fallback envelope
+ * from the host; `config` is a hard harness-configuration failure — no
+ * retry, no fallback; `harness_threw` means an injected dependency threw and
+ * the guard converted it). MAX_TOKENS-truncated responses only route to
+ * repair/fallback after extraction+validation fail — a complete valid
+ * envelope still succeeds, and the repair retry raises the cap
+ * (`repairMaxOutputTokens`) and lowers the thinking level one step.
+ *
+ * Since 0.3.0 the executor never applies or forwards `temperature`
+ * (deprecated; upcoming Gemini models error on it), and `thinkingLevel` is
+ * `'low' | 'medium' | 'high'` (`'minimal'` hard-400s on Gemini 3.7/3.8).
  *
  * All behavioral constants are tunables: exported `DEFAULT_*` recommended
  * defaults, caller overrides via {@link HarnessOptions}. Deterministic in
@@ -362,6 +373,16 @@ export type {
   CreateHarnessResult,
   HarnessOptions
 } from './policy/executor';
+
+/**
+ * Recommended model chain (SSOT).
+ *
+ * `RECOMMENDED_FLASH_MODEL_CHAIN` is the one declaration of the recommended
+ * Gemini Flash fallback chain. App seams import it — never re-declare a
+ * copy. Docs: `docs/lessons/model-config.md`.
+ */
+export { RECOMMENDED_FLASH_MODEL_CHAIN } from './policy/modelChain';
+export type { RecommendedFlashModel } from './policy/modelChain';
 
 /**
  * Record / replay transports.

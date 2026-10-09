@@ -134,6 +134,7 @@ console.log(result); // { kind: 'proposal', operations: [...] }
 - [ADR-0001: Belt-and-Suspenders Contracts](docs/adr/0001-belt-and-suspenders-contracts.md) — why schema-in-prompt over responseSchema
 - [Gemini Debugging](docs/gemini-debugging.md) — troubleshooting degeneration loops
 - [Resilience & Clarification](docs/resilience-and-clarification.md) — proposal-only mutation boundary
+- [Lessons Hub](docs/lessons/README.md) — cross-app AI lessons: schema-in-prompt, degeneration, model config, harness policy, hosting costs, fencing, contract discipline
 
 ## License
 

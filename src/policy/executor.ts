@@ -24,11 +24,13 @@ import type {
   ToolBinding,
   FailureContext,
   TraceEntry,
+  TurnTrace,
   HarnessTelemetryEvent,
   IterationContext,
   HarnessTurnInput,
   HarnessResult,
-  AgentHarness
+  AgentHarness,
+  HarnessThinkingLevel
 } from '../transport/types';
 import type { AgentTurn } from '../envelope/envelope';
 
@@ -84,6 +86,10 @@ export const DEFAULT_MAX_TOTAL_TOOL_CALLS = 50;
 
 /**
  * Default sampling temperature for model calls.
+ *
+ * @deprecated Never applied since 0.3.0: upcoming Gemini models error on
+ * `temperature`/`top_p`/`top_k`, so the executor no longer applies or
+ * forwards any temperature. Retained only so existing imports keep compiling.
  */
 export const DEFAULT_TEMPERATURE = 0.1;
 
@@ -94,8 +100,9 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 8_192;
 
 /**
  * Default thinking level for models that support reasoning traces.
+ * `'minimal'` is not a valid level on Gemini 3.7/3.8 (HTTP 400).
  */
-export const DEFAULT_THINKING_LEVEL: 'low' | 'minimal' = 'low';
+export const DEFAULT_THINKING_LEVEL: HarnessThinkingLevel = 'low';
 
 /**
  * Default minimum remaining budget (ms) required to attempt a repair call.
@@ -131,12 +138,25 @@ export interface HarnessOptions {
   readonly perModelTimeoutMs?: number;
   /** Total time budget for the turn (default DEFAULT_TOTAL_BUDGET_MS) */
   readonly totalBudgetMs?: number;
-  /** Sampling temperature (default DEFAULT_TEMPERATURE, 0.0..2.0) */
+  /**
+   * Sampling temperature.
+   *
+   * @deprecated Never transmitted since 0.3.0 (upcoming Gemini models error
+   * on `temperature`). Still validated when supplied, but ignored — no longer
+   * applied to any outgoing request.
+   */
   readonly temperature?: number;
   /** Maximum output tokens (default DEFAULT_MAX_OUTPUT_TOKENS, positive integer) */
   readonly maxOutputTokens?: number;
+  /**
+   * Maximum output tokens for REPAIR calls only (default `maxOutputTokens`,
+   * positive integer). Lets a host split caps, e.g. 8_192 for first attempts
+   * and 65_536 for repairs of truncated (MAX_TOKENS) outputs. Deliberately no
+   * `>= maxOutputTokens` invariant — either direction is a legitimate policy.
+   */
+  readonly repairMaxOutputTokens?: number;
   /** Thinking level for models with reasoning traces (default DEFAULT_THINKING_LEVEL) */
-  readonly thinkingLevel?: 'low' | 'minimal';
+  readonly thinkingLevel?: HarnessThinkingLevel;
   /** Maximum repair attempts (default DEFAULT_MAX_REPAIRS) */
   readonly maxRepairs?: number;
   /** Degenerations before abort (default DEFAULT_MAX_DEGENERATIONS_BEFORE_ABORT) */
@@ -175,6 +195,7 @@ export type ConfigFailureCode =
   | 'budget_invalid'
   | 'temperature_invalid'
   | 'output_tokens_invalid'
+  | 'repair_output_tokens_invalid'
   | 'thinking_level_invalid'
   | 'repairs_invalid'
   | 'degenerations_invalid'
@@ -233,6 +254,16 @@ interface HarnessState {
 }
 
 /**
+ * Partial turn trace reported to the never-rejects wrapper as soon as turn
+ * identity exists (entries is the live accumulator; endedAt comes later).
+ */
+interface TurnTraceScaffold {
+  readonly correlationId: string;
+  readonly startedAt: number;
+  readonly entries: TraceEntry[];
+}
+
+/**
  * Normalized candidate output (tool call or extracted JSON).
  */
 interface NormalizedCandidate {
@@ -263,6 +294,73 @@ function formatErrorMessage(err: unknown): string {
     }
   }
   return String(err);
+}
+
+/**
+ * Races an operation against the injected-sleep deadline (single shared
+ * implementation for model, repair, and tool-handler calls).
+ *
+ * Both arms of the sleep's `.then` reject the race: the deadline firing
+ * rejects with `timeoutMessage` (classified non-transient by the caller's
+ * error handling), and a rejecting injected `sleep` rejects with the sleep
+ * error itself — never a floating rejection, per the never-rejects contract.
+ */
+function raceSleepDeadline<T>(
+  operation: Promise<T>,
+  sleep: (ms: number) => Promise<void>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  return Promise.race([
+    operation,
+    new Promise<T>((_resolve, reject) =>
+      sleep(timeoutMs).then(
+        () => reject(new Error(timeoutMessage)),
+        (sleepErr: unknown) =>
+          reject(sleepErr instanceof Error ? sleepErr : new Error(`Injected sleep rejected: ${formatErrorMessage(sleepErr)}`))
+      )
+    )
+  ]);
+}
+
+/**
+ * Safe fallback turn used when no host handler is configured and as the last
+ * resort when even the host's `onFallbackExhausted` throws.
+ */
+// Shared module singleton returned on every fallback path, so it is frozen
+// (envelope included): a host mutating its returned turn must never leak
+// into the next caller's fallback.
+const DEFAULT_FALLBACK_QUESTION_TURN: AgentTurn<never> = Object.freeze({
+  envelope: Object.freeze({
+    state: 'question',
+    questionText: "I couldn't safely process that request. Could you please clarify or rephrase what you'd like to do?",
+    explanation: 'I was unable to validate a response from the model.'
+  })
+});
+
+/**
+ * Default `onFallbackExhausted` handler: accepts the failure context (unused)
+ * and returns the safe question turn.
+ */
+const defaultFallbackHandler = (): AgentTurn<never> => DEFAULT_FALLBACK_QUESTION_TURN;
+
+/**
+ * Thinking-level order used when lowering after a MAX_TOKENS-truncated
+ * failure: fewer thinking tokens leaves more of the output-token budget for
+ * the actual payload.
+ */
+const THINKING_LEVEL_LOWER_ORDER: readonly HarnessThinkingLevel[] = ['low', 'medium', 'high'];
+
+/**
+ * Lowers a thinking level one step for a MAX_TOKENS retry ('high' ->
+ * 'medium', 'medium' -> 'low', 'low' stays 'low', absent stays absent).
+ */
+function lowerThinkingLevel(level: HarnessThinkingLevel | undefined): HarnessThinkingLevel | undefined {
+  if (level === undefined) {
+    return undefined;
+  }
+  const idx = THINKING_LEVEL_LOWER_ORDER.indexOf(level);
+  return idx <= 0 ? 'low' : THINKING_LEVEL_LOWER_ORDER[idx - 1];
 }
 
 // ============================================================================
@@ -342,7 +440,10 @@ function validateOptions(options: HarnessOptions): readonly ConfigFailure[] {
     failures.push({ code: 'tool_caps_invalid', message: 'maxTotalToolCalls must be a non-negative integer.' });
   }
 
-  // Temperature must be finite and in range [0, 2]
+  // Temperature must be finite and in range [0, 2].
+  // Deprecated since 0.3.0 (never transmitted), but still validated so a host
+  // with a stale temperature config fails loudly at createHarness instead of
+  // silently carrying an invalid value.
   const temp = options.temperature;
   if (temp !== undefined && (typeof temp !== 'number' || !Number.isFinite(temp) || temp < 0 || temp > 2)) {
     failures.push({ code: 'temperature_invalid', message: 'temperature must be a finite number in range [0, 2].' });
@@ -354,10 +455,18 @@ function validateOptions(options: HarnessOptions): readonly ConfigFailure[] {
     failures.push({ code: 'output_tokens_invalid', message: 'maxOutputTokens must be a positive integer.' });
   }
 
-  // Thinking level must be valid
+  // Repair max output tokens must be positive integer (defaults to
+  // maxOutputTokens; intentionally no cross-field invariant — either
+  // direction of the split is a legitimate policy).
+  const repairMaxTokens = options.repairMaxOutputTokens;
+  if (repairMaxTokens !== undefined && (typeof repairMaxTokens !== 'number' || !Number.isInteger(repairMaxTokens) || repairMaxTokens <= 0)) {
+    failures.push({ code: 'repair_output_tokens_invalid', message: 'repairMaxOutputTokens must be a positive integer.' });
+  }
+
+  // Thinking level must be valid ('minimal' hard-400s on Gemini 3.7/3.8)
   const thinking = options.thinkingLevel;
-  if (thinking !== undefined && thinking !== 'low' && thinking !== 'minimal') {
-    failures.push({ code: 'thinking_level_invalid', message: 'thinkingLevel must be "low" or "minimal".' });
+  if (thinking !== undefined && thinking !== 'low' && thinking !== 'medium' && thinking !== 'high') {
+    failures.push({ code: 'thinking_level_invalid', message: 'thinkingLevel must be "low", "medium", or "high".' });
   }
 
   return failures;
@@ -389,9 +498,9 @@ export function createHarness<P>(
   const resolved: Required<
     Omit<
       HarnessOptions,
-      'tools' | 'onTelemetry' | 'onIterationContext' | 'onFallbackExhausted' | 'thinkingLevel'
+      'tools' | 'onTelemetry' | 'onIterationContext' | 'onFallbackExhausted' | 'thinkingLevel' | 'temperature'
     >
-  > & { thinkingLevel?: 'low' | 'minimal' } = {
+  > & { thinkingLevel?: HarnessThinkingLevel } = {
     transport: options.transport,
     models: options.models,
     maxIterations: options.maxIterations ?? DEFAULT_MAX_ITERATIONS,
@@ -404,8 +513,10 @@ export function createHarness<P>(
     transientBackoffMs: options.transientBackoffMs ?? DEFAULT_TRANSIENT_BACKOFF_MS,
     minBudgetForRepairMs: options.minBudgetForRepairMs ?? DEFAULT_MIN_BUDGET_FOR_REPAIR_MS,
     maxTransientRetriesPerModel: options.maxTransientRetriesPerModel ?? DEFAULT_MAX_TRANSIENT_RETRIES_PER_MODEL,
-    temperature: options.temperature ?? DEFAULT_TEMPERATURE,
     maxOutputTokens: options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    // Defaults to the regular cap unless the host splits (e.g. 8_192 first
+    // attempt / 65_536 repair of truncated outputs).
+    repairMaxOutputTokens: options.repairMaxOutputTokens ?? options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
     // Opt-in: the Gemini API rejects thinkingLevel for several models
     // (HTTP 400 "Thinking level is not supported for this model"), so the
     // transport must omit it unless the host explicitly configures it.
@@ -415,8 +526,16 @@ export function createHarness<P>(
     sleep: options.sleep ?? ((ms: number) => new Promise(resolve => setTimeout(resolve, ms)))
   };
 
-  const harness: AgentHarness<P> = {
-    async runTurn(input: HarnessTurnInput): Promise<HarnessResult<P>> {
+  /**
+   * The policy loop proper: model fallback chain, iterations, tools, repair,
+   * degeneration, transient backoff. Reports its (live) trace scaffold to
+   * `onStateReady` as soon as turn identity exists so the never-rejects
+   * wrapper can build a trace even when the loop throws mid-flight.
+   */
+  const executePolicyTurn = async (
+    input: HarnessTurnInput,
+    onStateReady: (partial: TurnTraceScaffold) => void
+  ): Promise<HarnessResult<P>> => {
       const correlationId = resolved.idFactory();
       const startedAt = resolved.now();
 
@@ -432,6 +551,8 @@ export function createHarness<P>(
         transientRetryCounts: new Map(),
         toolResults: []
       };
+
+      onStateReady({ correlationId, startedAt, entries: state.traceEntries });
 
       // Emit telemetry safely (listener throws never break the turn)
       const emit = (e: HarnessTelemetryEvent): void => {
@@ -498,17 +619,7 @@ export function createHarness<P>(
         return { extractedJson: extracted.ok ? extracted.parsed : undefined, ambiguous: false };
       };
 
-      // Default fallback handler (context provided but unused in default impl)
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const defaultFallbackHandler = (_ctx: FailureContext): AgentTurn<never> => {
-        return {
-          envelope: {
-            state: 'question',
-            questionText: "I couldn't safely process that request. Could you please clarify or rephrase what you'd like to do?",
-            explanation: 'I was unable to validate a response from the model.'
-          }
-        };
-      };
+      // Default fallback handler is the module-level DEFAULT_FALLBACK_QUESTION_TURN.
 
       // Tool declarations are fixed for the whole turn
       const toolDeclarations = options.tools?.map(tb => tb.contract) ?? [];
@@ -520,12 +631,18 @@ export function createHarness<P>(
        * and validates the repaired candidate. The caller checks and decrements
        * the repair budget; every non-success outcome maps to "fall back to the
        * next model".
+       *
+       * Repair requests carry `repairMaxOutputTokens` (independently of the
+       * first-attempt cap). When the failure followed a MAX_TOKENS-truncated
+       * response, the retry also lowers the thinking level one step — fewer
+       * thinking tokens leaves more of the token budget for the payload.
        */
       const attemptRepair = async (
         model: string,
         iteration: number,
         failureDescription: string,
-        failedOutputSnippet: string
+        failedOutputSnippet: string,
+        hitMaxTokens: boolean
       ): Promise<{ readonly ok: true; readonly turn: AgentTurn<P> } | { readonly ok: false }> => {
         const repairPrompt = `${composeFullPrompt()}
 
@@ -541,9 +658,10 @@ Please fix the error and return ONLY a valid JSON object following the output co
           systemInstruction: input.systemInstruction,
           promptText: repairPrompt,
           toolDeclarations,
-          temperature: resolved.temperature,
-          maxOutputTokens: resolved.maxOutputTokens,
-          thinkingLevel: resolved.thinkingLevel
+          maxOutputTokens: resolved.repairMaxOutputTokens,
+          thinkingLevel: hitMaxTokens
+            ? lowerThinkingLevel(resolved.thinkingLevel)
+            : resolved.thinkingLevel
         };
 
         const callStart = resolved.now();
@@ -555,10 +673,12 @@ Please fix the error and return ONLY a valid JSON object following the output co
           }
 
           const timeoutMs = Math.min(resolved.perModelTimeoutMs, Math.max(remainingBudget, 1));
-          const repairResp = await Promise.race([
+          const repairResp = await raceSleepDeadline(
             resolved.transport.complete(repairReq, { timeoutMs }),
-            new Promise<LlmResponse>((_, reject) => resolved.sleep(timeoutMs).then(() => reject(new Error('Repair call timed out'))))
-          ]);
+            resolved.sleep,
+            timeoutMs,
+            'Repair call timed out'
+          );
 
           const repairCandidate = normalizeCandidate(repairResp);
           if (!repairCandidate.extractedJson) {
@@ -650,13 +770,13 @@ Please fix the error and return ONLY a valid JSON object following the output co
             };
           }
 
-          // Compose request
+          // Compose request. Temperature is deliberately NOT forwarded:
+          // upcoming Gemini models error on temperature/top_p/top_k.
           const req: LlmRequest = {
             model,
             systemInstruction: input.systemInstruction,
             promptText: composeFullPrompt(),
             toolDeclarations,
-            temperature: resolved.temperature,
             maxOutputTokens: resolved.maxOutputTokens,
             thinkingLevel: resolved.thinkingLevel
           };
@@ -668,10 +788,12 @@ Please fix the error and return ONLY a valid JSON object following the output co
           try {
             const remainingBudget = resolved.totalBudgetMs - (resolved.now() - startedAt);
             const timeoutMs = Math.min(resolved.perModelTimeoutMs, Math.max(remainingBudget, 1));
-            resp = await Promise.race([
+            resp = await raceSleepDeadline(
               resolved.transport.complete(req, { timeoutMs }),
-              new Promise<LlmResponse>((_, reject) => resolved.sleep(timeoutMs).then(() => reject(new Error('Model call timed out'))))
-            ]);
+              resolved.sleep,
+              timeoutMs,
+              'Model call timed out'
+            );
           } catch (err) {
             dbg.warn('Model call error:', err);
             const isTransient = isTransientProviderError(err);
@@ -774,8 +896,19 @@ Please fix the error and return ONLY a valid JSON object following the output co
           }
 
           const degeneration = degenerationResult.verdict;
+          // MAX_TOKENS guard: `max_tokens` alone is only a suggestive
+          // signature. A MAX_TOKENS response carrying a complete valid
+          // envelope must still succeed, and one that fails
+          // extraction/validation routes to repair (with retry tuning below),
+          // never to the degeneration skip. Only the conclusive
+          // `ngram_repetition` signature keeps the unconditional degeneration
+          // path. Turn-level failures on this path surface under the existing
+          // failure kinds (`exhausted` / `all_fallbacks` / `budget`) — the
+          // guard re-routes, it does not add a terminal state.
+          const conclusiveDegeneration = degeneration.signatures.includes('ngram_repetition');
+          const hitMaxTokens = degeneration.signatures.includes('max_tokens');
 
-          if (degeneration.degenerate) {
+          if (conclusiveDegeneration) {
             emit({
               type: 'degenerate_output',
               correlationId,
@@ -886,10 +1019,12 @@ Please fix the error and return ONLY a valid JSON object following the output co
 
             // Invoke tool handler
             try {
-              const toolResult = await Promise.race([
-                toolBinding.handler(toolArgs),
-                new Promise<ToolResult>((_, reject) => resolved.sleep(resolved.perModelTimeoutMs).then(() => reject(new Error('Tool handler timed out'))))
-              ]);
+              const toolResult = await raceSleepDeadline(
+                Promise.resolve(toolBinding.handler(toolArgs)),
+                resolved.sleep,
+                resolved.perModelTimeoutMs,
+                'Tool handler timed out'
+              );
 
               state.toolResults.push({ name: toolName, args: toolArgs, result: toolResult });
               state.remainingToolCalls--;
@@ -913,7 +1048,8 @@ Please fix the error and return ONLY a valid JSON object following the output co
             }
           }
 
-          // No tool call -> validate envelope
+          // No tool call -> validate envelope. The falsy check also guarantees
+          // an empty-string rawText is never handed to the validator.
           const payload = candidate.extractedJson;
           if (!payload) {
             addTrace({ kind: 'decision', decision: 'extraction_failed', detail: `Failed to extract JSON from raw response (length: ${resp.rawText.length})` });
@@ -927,7 +1063,8 @@ Please fix the error and return ONLY a valid JSON object following the output co
                 model,
                 iteration,
                 'No valid JSON object could be extracted from the response. Please provide a valid JSON response.',
-                snippet
+                snippet,
+                hitMaxTokens
               );
               if (repair.ok) {
                 return {
@@ -956,7 +1093,8 @@ Please fix the error and return ONLY a valid JSON object following the output co
                 model,
                 iteration,
                 `Validation failed: ${validation.failure.code} - ${validation.failure.message}`,
-                snippet
+                snippet,
+                hitMaxTokens
               );
               if (repair.ok) {
                 return {
@@ -1002,6 +1140,52 @@ Please fix the error and return ONLY a valid JSON object following the output co
         turn: fallbackTurn,
         trace: { correlationId, entries: state.traceEntries, startedAt, endedAt: resolved.now() }
       };
+    };
+
+  /**
+   * Never-rejects guard: the policy loop catches transport and telemetry
+   * throws, but injected dependencies (`sleep`, `onFallbackExhausted`,
+   * `onIterationContext`, `now`, `idFactory`) can still throw or reject —
+   * which would surface as an unhandled rejection inside a callable. Any
+   * escape is converted to a typed `kind: 'harness_threw'` failure with a
+   * safe question-envelope turn. Note: `resolved.now()` may itself be the
+   * thrower, so the catch path uses `Date.now()` directly.
+   */
+  const harness: AgentHarness<P> = {
+    runTurn: async (input: HarnessTurnInput): Promise<HarnessResult<P>> => {
+      let partial: TurnTraceScaffold | undefined;
+      try {
+        return await executePolicyTurn(input, (t) => {
+          partial = t;
+        });
+      } catch (err) {
+        const errorMessage = formatErrorMessage(err);
+        dbg.error('Harness executor threw (harness_threw):', err);
+        const endedAt = Date.now();
+        const trace: TurnTrace = {
+          correlationId: partial?.correlationId ?? 'harness_threw_before_turn_start',
+          entries: [
+            ...(partial?.entries ?? []),
+            { kind: 'decision', decision: 'harness_threw', detail: errorMessage } satisfies TraceEntry
+          ],
+          startedAt: partial?.startedAt ?? endedAt,
+          endedAt
+        };
+        const failureContext: FailureContext = {
+          correlationId: trace.correlationId,
+          lastFailure: { code: 'malformed_json', message: `Harness executor threw: ${errorMessage}` },
+          trace
+        };
+        // The host fallback handler may itself be the thrower; fall back to
+        // the built-in question turn if it throws again.
+        let turn: AgentTurn<never>;
+        try {
+          turn = (options.onFallbackExhausted ?? defaultFallbackHandler)(failureContext);
+        } catch {
+          turn = DEFAULT_FALLBACK_QUESTION_TURN;
+        }
+        return { ok: false, kind: 'harness_threw', turn, trace };
+      }
     }
   };
 

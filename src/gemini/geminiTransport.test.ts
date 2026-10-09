@@ -386,7 +386,7 @@ describe('createGeminiTransport', () => {
       }
     });
 
-    it('passes through temperature, maxOutputTokens, and thinkingLevel', async () => {
+    it('NEVER transmits temperature; passes through maxOutputTokens and thinkingLevel', async () => {
       const mockClient = createMockClient();
       const result = createGeminiTransport({
         client: mockClient as unknown as Parameters<typeof createGeminiTransport>[0]['client']
@@ -401,6 +401,8 @@ describe('createGeminiTransport', () => {
           systemInstruction: 'Test',
           promptText: 'Test',
           toolDeclarations: [],
+          // Deprecated since 0.3.0: upcoming Gemini models error on temperature.
+          // Present on the request, must be dropped by the transport.
           temperature: 0.7,
           maxOutputTokens: 4096,
           thinkingLevel: 'low'
@@ -411,9 +413,38 @@ describe('createGeminiTransport', () => {
       const generateContentSpy = mockClient.models.generateContent as ReturnType<typeof vi.fn>;
       const capturedConfig = generateContentSpy.mock.calls[0]?.[0]?.config as Record<string, unknown>;
 
-      expect(capturedConfig?.temperature).toBe(0.7);
+      expect('temperature' in (capturedConfig ?? {})).toBe(false);
       expect(capturedConfig?.maxOutputTokens).toBe(4096);
       expect(capturedConfig?.thinkingConfig).toEqual({ thinkingLevel: 'low' });
+    });
+
+    it('passes through medium/high thinkingLevel without a cast (post-minimal union)', async () => {
+      const mockClient = createMockClient();
+      const result = createGeminiTransport({
+        client: mockClient as unknown as Parameters<typeof createGeminiTransport>[0]['client']
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      for (const thinkingLevel of ['medium', 'high'] as const) {
+        await result.transport.complete(
+          {
+            model: 'gemini-test',
+            systemInstruction: 'Test',
+            promptText: 'Test',
+            toolDeclarations: [],
+            thinkingLevel
+          },
+          { timeoutMs: 10_000 }
+        );
+      }
+
+      const generateContentSpy = mockClient.models.generateContent as ReturnType<typeof vi.fn>;
+      const firstConfig = generateContentSpy.mock.calls[0]?.[0]?.config as Record<string, unknown>;
+      const secondConfig = generateContentSpy.mock.calls[1]?.[0]?.config as Record<string, unknown>;
+      expect(firstConfig?.thinkingConfig).toEqual({ thinkingLevel: 'medium' });
+      expect(secondConfig?.thinkingConfig).toEqual({ thinkingLevel: 'high' });
     });
 
     it('uses the smaller of transport timeout and per-call timeout', async () => {

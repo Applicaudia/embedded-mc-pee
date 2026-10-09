@@ -1,6 +1,6 @@
 {
   "name": "embedded-mc-pee",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "description": "MCP-shaped harness for embedding tool-calling LLM intelligence into backends — typed envelopes, deterministic validation, record/replay",
   "license": "MIT",

@@ -19,8 +19,13 @@ import { assertJsonSafe } from '../json/jsonSafe';
  *
  * Bumped when the recording schema or hash algorithm changes incompatibly.
  * Old recordings must be rejected, not silently migrated.
+ *
+ * v2 (0.3.0): `temperature` removed from the hashed field set (it is no
+ * longer transmitted). Bumped so v1 recordings — whose hashes could depend on
+ * temperature — are rejected instead of parsing clean and then silently
+ * missing in strict replay (or live-calling in passthrough lanes).
  */
-export const DEFAULT_REPLAY_RECORDING_VERSION = 1;
+export const DEFAULT_REPLAY_RECORDING_VERSION = 2;
 
 // ============================================================================
 // Type Aliases
@@ -159,8 +164,11 @@ export function canonicalJsonStringify(
  * Computes a stable SHA-256 hash of an LlmRequest for record/replay lookup.
  *
  * The hash covers the full request: model, systemInstruction, promptText,
- * toolDeclarations, and present sampling parameters (temperature, maxOutputTokens,
+ * toolDeclarations, and present sampling parameters (maxOutputTokens,
  * thinkingLevel). Absent optional fields are not included (they use defaults).
+ * The deprecated `temperature` field is deliberately NOT hashed: it is never
+ * transmitted, so it cannot affect the served response (see v2 bump on
+ * DEFAULT_REPLAY_RECORDING_VERSION).
  *
  * Async signature rationale: Web Crypto API (`globalThis.crypto.subtle.digest`)
  * is Promise-based in both browsers and Node 20+. This library must run in both
@@ -180,9 +188,6 @@ export async function inputHashOf(
     toolDeclarations: req.toolDeclarations
   };
 
-  if (req.temperature !== undefined) {
-    hashInput.temperature = req.temperature;
-  }
   if (req.maxOutputTokens !== undefined) {
     hashInput.maxOutputTokens = req.maxOutputTokens;
   }
