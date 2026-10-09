@@ -297,6 +297,33 @@ function formatErrorMessage(err: unknown): string {
 }
 
 /**
+ * Races an operation against the injected-sleep deadline (single shared
+ * implementation for model, repair, and tool-handler calls).
+ *
+ * Both arms of the sleep's `.then` reject the race: the deadline firing
+ * rejects with `timeoutMessage` (classified non-transient by the caller's
+ * error handling), and a rejecting injected `sleep` rejects with the sleep
+ * error itself — never a floating rejection, per the never-rejects contract.
+ */
+function raceSleepDeadline<T>(
+  operation: Promise<T>,
+  sleep: (ms: number) => Promise<void>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  return Promise.race([
+    operation,
+    new Promise<T>((_resolve, reject) =>
+      sleep(timeoutMs).then(
+        () => reject(new Error(timeoutMessage)),
+        (sleepErr: unknown) =>
+          reject(sleepErr instanceof Error ? sleepErr : new Error(`Injected sleep rejected: ${formatErrorMessage(sleepErr)}`))
+      )
+    )
+  ]);
+}
+
+/**
  * Safe fallback turn used when no host handler is configured and as the last
  * resort when even the host's `onFallbackExhausted` throws.
  */
@@ -646,15 +673,12 @@ Please fix the error and return ONLY a valid JSON object following the output co
           }
 
           const timeoutMs = Math.min(resolved.perModelTimeoutMs, Math.max(remainingBudget, 1));
-          const repairResp = await Promise.race([
+          const repairResp = await raceSleepDeadline(
             resolved.transport.complete(repairReq, { timeoutMs }),
-            new Promise<LlmResponse>((_, reject) =>
-              resolved.sleep(timeoutMs).then(
-                () => reject(new Error('Repair call timed out')),
-                (sleepErr: unknown) => reject(sleepErr instanceof Error ? sleepErr : new Error(`Injected sleep rejected: ${formatErrorMessage(sleepErr)}`))
-              )
-            )
-          ]);
+            resolved.sleep,
+            timeoutMs,
+            'Repair call timed out'
+          );
 
           const repairCandidate = normalizeCandidate(repairResp);
           if (!repairCandidate.extractedJson) {
@@ -764,15 +788,12 @@ Please fix the error and return ONLY a valid JSON object following the output co
           try {
             const remainingBudget = resolved.totalBudgetMs - (resolved.now() - startedAt);
             const timeoutMs = Math.min(resolved.perModelTimeoutMs, Math.max(remainingBudget, 1));
-            resp = await Promise.race([
+            resp = await raceSleepDeadline(
               resolved.transport.complete(req, { timeoutMs }),
-              new Promise<LlmResponse>((_, reject) =>
-                resolved.sleep(timeoutMs).then(
-                  () => reject(new Error('Model call timed out')),
-                  (sleepErr: unknown) => reject(sleepErr instanceof Error ? sleepErr : new Error(`Injected sleep rejected: ${formatErrorMessage(sleepErr)}`))
-                )
-              )
-            ]);
+              resolved.sleep,
+              timeoutMs,
+              'Model call timed out'
+            );
           } catch (err) {
             dbg.warn('Model call error:', err);
             const isTransient = isTransientProviderError(err);
@@ -998,15 +1019,12 @@ Please fix the error and return ONLY a valid JSON object following the output co
 
             // Invoke tool handler
             try {
-              const toolResult = await Promise.race([
-                toolBinding.handler(toolArgs),
-                new Promise<ToolResult>((_, reject) =>
-                  resolved.sleep(resolved.perModelTimeoutMs).then(
-                    () => reject(new Error('Tool handler timed out')),
-                    (sleepErr: unknown) => reject(sleepErr instanceof Error ? sleepErr : new Error(`Injected sleep rejected: ${formatErrorMessage(sleepErr)}`))
-                  )
-                )
-              ]);
+              const toolResult = await raceSleepDeadline(
+                Promise.resolve(toolBinding.handler(toolArgs)),
+                resolved.sleep,
+                resolved.perModelTimeoutMs,
+                'Tool handler timed out'
+              );
 
               state.toolResults.push({ name: toolName, args: toolArgs, result: toolResult });
               state.remainingToolCalls--;

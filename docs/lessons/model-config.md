@@ -24,9 +24,11 @@ rationale comment). Rationale, in order:
 - `gemini-flash-latest` terminal only — an alias must never be primary
   (an alias silently retargets; a pinned version fails loudly when retired).
 
-Host seams adopt it as `models: [...(opts.models ?? RECOMMENDED_FLASH_MODEL_CHAIN)]`
-— import, never re-declare — and each seam's unit test asserts its default
-equals the library export.
+Host seams **must** adopt it as `models: [...(opts.models ??
+RECOMMENDED_FLASH_MODEL_CHAIN)]` — import, never re-declare — and each
+seam's unit test asserts its default equals the library export. No host
+seam has adopted it yet as of 0.3.0; adoption lands with each app's
+migration phase (closedloop first).
 
 ## Lesson H: Stop sending sampling parameters entirely
 

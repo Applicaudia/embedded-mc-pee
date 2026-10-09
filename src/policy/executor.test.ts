@@ -1077,6 +1077,59 @@ describe('Agent Harness Executor', () => {
     });
   });
 
+  describe('Timeout race (sleep deadline fires)', () => {
+    it('times out a hanging model call, records the model_error, and falls back to the next model', async () => {
+      // model-1 hangs forever; only the injected-sleep deadline can end the race
+      const hangingThenOkTransport: LlmTransport = {
+        complete: (req: LlmRequest): Promise<LlmResponse> => {
+          if (req.model === 'model-1') {
+            return new Promise<LlmResponse>(() => {});
+          }
+          return Promise.resolve({ rawText: JSON.stringify(VALID_PROPOSAL) });
+        }
+      };
+      const immediateSleep = vi.fn((): Promise<void> => Promise.resolve());
+      const telemetryEvents: HarnessTelemetryEvent[] = [];
+      const timeoutMs = 5;
+
+      const result = createHarness(
+        {
+          transport: hangingThenOkTransport,
+          models: ['model-1', 'model-2'],
+          maxIterations: 1,
+          perModelTimeoutMs: timeoutMs,
+          sleep: immediateSleep,
+          onTelemetry: (e) => { telemetryEvents.push(e); }
+        },
+        contract
+      );
+
+      if (!result.ok) {
+        throw new Error('Failed to create harness');
+      }
+
+      const turnResult = await result.harness.runTurn({
+        systemInstruction: 'You are a test agent.',
+        promptText: 'Test prompt'
+      });
+
+      // The deadline fired for model-1
+      expect(immediateSleep).toHaveBeenCalledWith(timeoutMs);
+      // Non-transient timeout -> fell back to model-2, which succeeded
+      expect(turnResult.ok).toBe(true);
+      if (turnResult.ok) {
+        expect(turnResult.turn.envelope.state).toBe('proposal');
+      }
+      const timeoutError = turnResult.trace.entries.find(
+        e => e.kind === 'model_error' && e.error === 'Model call timed out'
+      );
+      expect(timeoutError).toBeDefined();
+      expect(
+        telemetryEvents.some(e => e.type === 'fallback_model' && e.fromModel === 'model-1' && e.toModel === 'model-2')
+      ).toBe(true);
+    });
+  });
+
   describe('Transient error backoff', () => {
     it('backs off and retries on transient 429 error', async () => {
       let callCount = 0;
