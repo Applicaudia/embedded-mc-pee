@@ -30,7 +30,7 @@ import type {
   Part,
   FunctionDeclaration,
   FunctionCall,
-  ThinkingLevel
+  ThinkingConfig
 } from '@google/genai';
 import { dbg } from '../debug/debug';
 import type { LlmTransport, LlmRequest, LlmResponse } from '../transport/types';
@@ -238,7 +238,9 @@ function extractFirstFunctionCall(
  * The transport:
  * - Maps `toolDeclarations` to `functionDeclarations` (omits `tools` key when
  *   there are no tools — an empty array is invalid in the SDK).
- * - Sends `systemInstruction`, `contents`, and sampling parameters.
+ * - Sends `systemInstruction`, `contents`, and the sampling parameters that
+ *   survive 0.3.0 (`maxOutputTokens`, `thinkingLevel`); temperature is never
+ *   sent (upcoming Gemini models error on it).
  * - NEVER sets `responseSchema` per ADR-0001 (prevents repetition loops).
  * - Races the SDK call against a timeout (backstop to the harness's timeout).
  * - Extracts `rawText` and/or `toolCall` from responses.
@@ -304,16 +306,23 @@ export function createGeminiTransport(
         systemInstruction: req.systemInstruction
       };
 
-      // Add sampling parameters when present
-      if (req.temperature !== undefined) {
-        config.temperature = req.temperature;
-      }
+      // Add sampling parameters when present. Temperature is deliberately
+      // NEVER forwarded: upcoming Gemini models error on temperature/top_p/
+      // top_k. (The deprecated LlmRequest.temperature field is ignored here.)
       if (req.maxOutputTokens !== undefined) {
         config.maxOutputTokens = req.maxOutputTokens;
       }
       if (req.thinkingLevel !== undefined) {
-        // Map 'low'/'minimal' to the SDK's thinking config
-        config.thinkingConfig = { thinkingLevel: req.thinkingLevel as ThinkingLevel };
+        // The REST wire format is the lowercase level names ("low" |
+        // "medium" | "high" — ai.google.dev generate-content ThinkingConfig;
+        // the SDK passes thinkingConfig through verbatim, and the lowercase
+        // form is production-verified). The SDK's exported `ThinkingLevel`
+        // enum uses UPPERCASE member names, so the value is widened to the
+        // declared field type instead of being cast to the enum: the runtime
+        // string is the contract, not the enum.
+        config.thinkingConfig = {
+          thinkingLevel: req.thinkingLevel
+        } as unknown as ThinkingConfig;
       }
 
       // Build contents. Vision inputs (inlineData) come first, followed by

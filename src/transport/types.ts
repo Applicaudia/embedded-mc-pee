@@ -14,6 +14,17 @@ import type { ToolContract, ToolHandler } from '../tool/toolContract';
 // ============================================================================
 
 /**
+ * Thinking level for models that support reasoning traces.
+ *
+ * Narrowed in 0.3.0: `'minimal'` was removed because Gemini 3.7/3.8 Flash
+ * hard-reject it (HTTP 400) — only `'low' | 'medium' | 'high'` are valid on
+ * the models this library targets. Note that several models reject ANY
+ * thinkingLevel, so the field stays opt-in (the transport omits it unless the
+ * host explicitly configures it).
+ */
+export type HarnessThinkingLevel = 'low' | 'medium' | 'high';
+
+/**
  * Request sent to an LLM transport during a harness turn.
  *
  * All prompts and tool declarations are provided to the transport; the
@@ -29,12 +40,19 @@ export interface LlmRequest {
   readonly promptText: string;
   /** Tool contracts declared to the model (the "belt") */
   readonly toolDeclarations: ReadonlyArray<ToolContract>;
-  /** Sampling temperature (default 0.1 for deterministic outputs) */
+  /**
+   * Sampling temperature.
+   *
+   * @deprecated Never transmitted since 0.3.0: upcoming Gemini models error on
+   * `temperature`/`top_p`/`top_k`, so the harness no longer forwards it and
+   * the Gemini transport no longer maps it. Retained on the request type for
+   * source compatibility only; also excluded from the record/replay hash.
+   */
   readonly temperature?: number;
   /** Maximum output tokens (default 8192) */
   readonly maxOutputTokens?: number;
   /** Thinking level for models that support reasoning traces */
-  readonly thinkingLevel?: 'low' | 'minimal';
+  readonly thinkingLevel?: HarnessThinkingLevel;
   /** Inline data for vision inputs (image/png, image/jpeg, etc.) */
   readonly inlineData?: {
     readonly mimeType: string;
@@ -150,7 +168,8 @@ export type TraceEntry =
         | 'transient_backoff'
         | 'extraction_failed'
         | 'validation_failed'
-        | 'budget_exhausted';
+        | 'budget_exhausted'
+        | 'harness_threw';
       readonly detail?: string;
     };
 
@@ -232,26 +251,41 @@ export interface HarnessTurnInput {
 }
 
 /**
+ * Typed failure kinds for a harness turn.
+ *
+ * - `exhausted` / `budget` / `all_fallbacks` — policy outcomes (no valid
+ *   envelope obtained within iteration, time, or model-chain limits).
+ * - `config` — hard harness-configuration failure (e.g. invalid
+ *   degeneration-detection options); must not be retried or treated as model
+ *   behavior.
+ * - `harness_threw` — the executor itself threw (an injected dependency —
+ *   `sleep`, `onFallbackExhausted`, `onIterationContext`, `now`, `idFactory` —
+ *   rejected or threw). The wrapper converts this to a typed failure so
+ *   `runTurn` NEVER rejects; hosts switching on `kind` exhaustively are
+ *   compile-forced to handle it.
+ */
+export type HarnessFailureKind = 'exhausted' | 'budget' | 'all_fallbacks' | 'config' | 'harness_threw';
+
+/**
  * Result of a harness turn execution.
  *
  * Success (`ok: true`) returns a validated {@link AgentTurn<P>}` with trace.
- * Failure (`ok: false`) returns a typed failure kind with an {@link AgentTurn<never>}
- * (question envelope) and trace. The `config` kind is a hard failure: a
- * harness configuration bug (e.g. invalid degeneration-detection options)
- * that must not be retried or treated as model behavior.
+ * Failure (`ok: false`) returns a typed {@link HarnessFailureKind} with an
+ * {@link AgentTurn<never>} (question envelope) and trace.
  *
  * @template P - Payload type (only present when state === 'proposal')
  */
 export type HarnessResult<P> =
   | { readonly ok: true; readonly turn: AgentTurn<P>; readonly trace: TurnTrace }
-  | { readonly ok: false; readonly kind: 'exhausted' | 'budget' | 'all_fallbacks' | 'config'; readonly turn: AgentTurn<never>; readonly trace: TurnTrace };
+  | { readonly ok: false; readonly kind: HarnessFailureKind; readonly turn: AgentTurn<never>; readonly trace: TurnTrace };
 
 /**
  * Agent harness interface — the public entry point for tool-calling LLM turns.
  *
  * The harness manages model fallbacks, iteration budgets, tool execution,
  * repair attempts, degeneration detection, transient backoff, and telemetry.
- * It never rejects — all errors become typed failure results.
+ * It never rejects — all errors, including throws from injected dependencies,
+ * become typed failure results.
  *
  * @template P - Payload type (only present when state === 'proposal')
  */
@@ -260,7 +294,7 @@ export interface AgentHarness<P> {
    * Executes a single turn with the given input.
    *
    * @param input - Turn input (system instruction, prompt text, optional conversation context)
-   * @returns Validated turn on success, typed failure on exhaustion/budget/fallback — never rejects
+   * @returns Validated turn on success, typed failure on exhaustion/budget/fallback/harness-throw — never rejects
    */
   runTurn(input: HarnessTurnInput): Promise<HarnessResult<P>>;
 }

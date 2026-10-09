@@ -694,7 +694,7 @@ describe('Recording + Replay Integration', () => {
       promptText: 'Request with all optional fields',
       temperature: 0.7,
       maxOutputTokens: 2048,
-      thinkingLevel: 'minimal'
+      thinkingLevel: 'medium'
     });
 
     await recorder.complete(req1, { timeoutMs: 5000 });
@@ -727,5 +727,28 @@ describe('Recording + Replay Integration', () => {
     expect(replay1.rawText).toBe(response1.rawText);
     expect(replay2.rawText).toBe(response2.rawText);
     expect(replay3.rawText).toBe(response3.rawText);
+  });
+
+  it('should replay a hit regardless of temperature on the request (v2 hash)', async () => {
+    const response = makeResponse({ rawText: 'Response for temperature-independent request' });
+    const fakeTransport = new FakeTransport([response]);
+    const recordingMap = new Map<string, { request: LlmRequest; response: LlmResponse }>();
+    const recorder = new RecordingTransport(fakeTransport, recordingMap);
+
+    // Record WITH a (deprecated, never-transmitted) temperature...
+    await recorder.complete(
+      makeRequest({ promptText: 'Temperature-independent request', temperature: 0.7 }),
+      { timeoutMs: 5000 }
+    );
+
+    const recordedEntries = Object.fromEntries(recordingMap) as RecordingEntries;
+    // ...strict-mode replay WITHOUT it must still hit the same entry.
+    const replay = new ReplayTransport(recordedEntries, { missMode: 'strict' });
+    const replayed = await replay.complete(
+      makeRequest({ promptText: 'Temperature-independent request' }),
+      { timeoutMs: 5000 }
+    );
+
+    expect(replayed.rawText).toBe(response.rawText);
   });
 });

@@ -225,23 +225,29 @@ describe('inputHashOf', () => {
     }
   });
 
-  it('should produce different hashes for different temperatures', async () => {
+  it('should NOT include deprecated temperature in the hash (0.3.0 removal)', async () => {
     const req1 = makeRequest({ temperature: 0.1 });
     const req2 = makeRequest({ temperature: 0.9 });
+    const req3 = makeRequest({}); // no temperature
 
     const hash1 = await inputHashOf(req1);
     const hash2 = await inputHashOf(req2);
+    const hash3 = await inputHashOf(req3);
 
     expect(hash1.ok).toBe(true);
     expect(hash2.ok).toBe(true);
-    if (hash1.ok && hash2.ok) {
-      expect(hash1.value).not.toBe(hash2.value);
+    expect(hash3.ok).toBe(true);
+    if (hash1.ok && hash2.ok && hash3.ok) {
+      // Temperature is never transmitted, so it cannot affect the served
+      // response and must not split replay recordings.
+      expect(hash1.value).toBe(hash3.value);
+      expect(hash2.value).toBe(hash3.value);
     }
   });
 
-  it('should produce different hashes for presence vs absence of optional field', async () => {
-    const req1 = makeRequest({ temperature: 0.5 });
-    const req2 = makeRequest({}); // no temperature
+  it('should produce different hashes for presence vs absence of hashed optional fields', async () => {
+    const req1 = makeRequest({ maxOutputTokens: 1000 });
+    const req2 = makeRequest({}); // no maxOutputTokens
 
     const hash1 = await inputHashOf(req1);
     const hash2 = await inputHashOf(req2);
@@ -341,5 +347,12 @@ describe('DEFAULT_REPLAY_RECORDING_VERSION', () => {
   it('should be a positive integer', () => {
     expect(DEFAULT_REPLAY_RECORDING_VERSION).toBeGreaterThan(0);
     expect(Number.isInteger(DEFAULT_REPLAY_RECORDING_VERSION)).toBe(true);
+  });
+
+  // Tripwire: v2 removed temperature from the hashed field set. If this
+  // bumps again, recordings must be regenerated in the same commit as the
+  // hash change and this pin moves with it.
+  it('should be pinned to 2 (temperature removal)', () => {
+    expect(DEFAULT_REPLAY_RECORDING_VERSION).toBe(2);
   });
 });
