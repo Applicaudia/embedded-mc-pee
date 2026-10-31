@@ -53,11 +53,11 @@ export interface LlmRequest {
   readonly maxOutputTokens?: number;
   /** Thinking level for models that support reasoning traces */
   readonly thinkingLevel?: HarnessThinkingLevel;
-  /** Inline data for vision inputs (image/png, image/jpeg, etc.) */
-  readonly inlineData?: {
+  /** Inline data parts for vision inputs (image/png, image/jpeg, pdf, ...); one part per image so each gets the model's full per-image resolution budget. */
+  readonly inlineData?: ReadonlyArray<{
     readonly mimeType: string;
     readonly data: string;
-  };
+  }>;
 }
 
 /**

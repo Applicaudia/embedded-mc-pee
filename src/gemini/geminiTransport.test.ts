@@ -244,7 +244,7 @@ describe('createGeminiTransport', () => {
       ]);
     });
 
-    it('prepends inlineData part for vision inputs', async () => {
+    it('prepends one inlineData part per vision input, before the prompt text', async () => {
       const mockClient = createMockClient();
       const result = createGeminiTransport({
         client: mockClient as unknown as Parameters<typeof createGeminiTransport>[0]['client']
@@ -259,7 +259,10 @@ describe('createGeminiTransport', () => {
           systemInstruction: 'You transcribe documents.',
           promptText: 'Transcribe this document.',
           toolDeclarations: [],
-          inlineData: { mimeType: 'application/pdf', data: 'aGVsbG8=' }
+          inlineData: [
+            { mimeType: 'application/pdf', data: 'aGVsbG8=' },
+            { mimeType: 'image/png', data: 'aW5r' }
+          ]
         },
         { timeoutMs: 10_000 }
       );
@@ -273,6 +276,7 @@ describe('createGeminiTransport', () => {
           role: 'user',
           parts: [
             { inlineData: { mimeType: 'application/pdf', data: 'aGVsbG8=' } },
+            { inlineData: { mimeType: 'image/png', data: 'aW5r' } },
             { text: 'Transcribe this document.' }
           ]
         }
