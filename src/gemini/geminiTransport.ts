@@ -325,11 +325,13 @@ export function createGeminiTransport(
         };
       }
 
-      // Build contents. Vision inputs (inlineData) come first, followed by
+      // Build contents. Vision inputs (inlineData parts) come first, followed by
       // the prompt text; text-only requests are unchanged.
       const parts: Part[] = [];
       if (req.inlineData !== undefined) {
-        parts.push({ inlineData: req.inlineData });
+        for (const part of req.inlineData) {
+          parts.push({ inlineData: part });
+        }
       }
       parts.push({ text: req.promptText });
       const contents: Content[] = [

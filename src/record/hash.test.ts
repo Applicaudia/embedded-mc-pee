@@ -282,10 +282,7 @@ describe('inputHashOf', () => {
       systemInstruction: 'You are a helpful assistant.',
       promptText: 'What is in this image?',
       toolDeclarations: [],
-      inlineData: {
-        mimeType: 'image/png',
-        data: 'base64encodedimage1'
-      }
+      inlineData: [{ mimeType: 'image/png', data: 'base64encodedimage1' }]
     };
 
     const req2: LlmRequest = {
@@ -293,10 +290,7 @@ describe('inputHashOf', () => {
       systemInstruction: 'You are a helpful assistant.',
       promptText: 'What is in this image?',
       toolDeclarations: [],
-      inlineData: {
-        mimeType: 'image/png',
-        data: 'base64encodedimage2'
-      }
+      inlineData: [{ mimeType: 'image/png', data: 'base64encodedimage2' }]
     };
 
     const hash1 = await inputHashOf(req1);
@@ -310,11 +304,33 @@ describe('inputHashOf', () => {
     }
   });
 
-  it('should produce same hash for identical inlineData', async () => {
-    const baseInlineData = {
-      mimeType: 'image/jpeg',
-      data: 'abc123def456'
+  // Multi-part vision (closedloop ink pages): part count and order are part
+  // of the replay identity.
+  it('should produce different hashes for different multi-part inlineData', async () => {
+    const partA = { mimeType: 'image/png', data: 'aW5rLXBhZ2UtMQ==' };
+    const partB = { mimeType: 'image/png', data: 'aW5rLXBhZ2UtMg==' };
+    const baseRequest = {
+      model: 'gemini-2.0-flash',
+      systemInstruction: 'You are a helpful assistant.',
+      promptText: 'Summarize the sketches',
+      toolDeclarations: []
     };
+
+    const hashTwoParts = await inputHashOf({ ...baseRequest, inlineData: [partA, partB] });
+    const hashOnePart = await inputHashOf({ ...baseRequest, inlineData: [partA] });
+    const hashReordered = await inputHashOf({ ...baseRequest, inlineData: [partB, partA] });
+
+    expect(hashTwoParts.ok).toBe(true);
+    expect(hashOnePart.ok).toBe(true);
+    expect(hashReordered.ok).toBe(true);
+    if (hashTwoParts.ok && hashOnePart.ok && hashReordered.ok) {
+      expect(hashTwoParts.value).not.toBe(hashOnePart.value);
+      expect(hashTwoParts.value).not.toBe(hashReordered.value);
+    }
+  });
+
+  it('should produce same hash for identical inlineData', async () => {
+    const baseInlineData = [{ mimeType: 'image/jpeg', data: 'abc123def456' }];
 
     const req1: LlmRequest = {
       model: 'gemini-2.0-flash',
@@ -329,7 +345,7 @@ describe('inputHashOf', () => {
       systemInstruction: 'You are a helpful assistant.',
       promptText: 'Describe this image',
       toolDeclarations: [],
-      inlineData: { ...baseInlineData }
+      inlineData: [...baseInlineData]
     };
 
     const hash1 = await inputHashOf(req1);
